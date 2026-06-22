@@ -1,4 +1,4 @@
-"""Per-node status checks: ping, http, https, tcp, ssh, prometheus, health, none."""
+"""Per-node status checks: ping, http, https, tcp, ssh, prometheus, health, proxmox, none."""
 import asyncio
 import logging
 import socket
@@ -18,6 +18,13 @@ async def check_node(check_method: str, target: str | None, ip: str | None) -> d
     """
     if check_method == "none":
         return {"status": "online", "response_time_ms": None}
+
+    # Proxmox checks resolve their own host/credentials from a saved integration.
+    # `target` is the node's external_id ("{integration_id}:{vmid}").
+    if check_method == "proxmox":
+        from app.services.proxmox_status import check_proxmox_node  # avoid circular import
+
+        return await check_proxmox_node(target)
 
     # Use only the first IP when the field contains comma-separated addresses
     raw_ip = ip.split(",")[0].strip() if ip else None

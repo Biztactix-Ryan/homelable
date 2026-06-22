@@ -142,15 +142,18 @@ async def test_run_status_checks_handles_check_error_gracefully(mem_db):
 # ---------------------------------------------------------------------------
 
 def test_scheduler_uses_settings_interval():
-    """Scheduler registers the job with the interval from settings."""
+    """Scheduler registers the status_checks job with the interval from settings."""
     mock_sched = MagicMock()
     with patch("app.core.scheduler.settings") as mock_settings, \
          patch("app.core.scheduler.AsyncIOScheduler", return_value=mock_sched):
         mock_settings.status_checker_interval = 45
         mock_settings.service_check_enabled = False
         start_scheduler()
-        _, kwargs = mock_sched.add_job.call_args
-        assert kwargs["seconds"] == 45
+        status_call = next(
+            call for call in mock_sched.add_job.call_args_list
+            if call.kwargs.get("id") == "status_checks"
+        )
+        assert status_call.kwargs["seconds"] == 45
 
 
 def test_start_and_stop_scheduler():
@@ -159,7 +162,9 @@ def test_start_and_stop_scheduler():
     with patch("app.core.scheduler.AsyncIOScheduler", return_value=mock_sched):
         start_scheduler()
         stop_scheduler()
-        mock_sched.add_job.assert_called_once()
+        job_ids = {call.kwargs.get("id") for call in mock_sched.add_job.call_args_list}
+        assert "status_checks" in job_ids
+        assert "proxmox_syncs" in job_ids
         mock_sched.start.assert_called_once()
         mock_sched.shutdown.assert_called_once()
 

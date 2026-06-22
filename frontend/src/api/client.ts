@@ -156,3 +156,49 @@ export const zigbeeApi = {
       error: string | null
     }>('/zigbee/import-pending', data),
 }
+
+export interface ProxmoxCredentials {
+  host: string
+  port: number
+  verify_tls: boolean
+  auth_type: 'token' | 'password'
+  token_user?: string | null
+  token_id?: string | null
+  token_secret?: string | null
+  username?: string | null
+  password?: string | null
+}
+
+export const proxmoxApi = {
+  testConnection: (data: ProxmoxCredentials) =>
+    api.post<{ connected: boolean; message: string }>('/proxmox/test-connection', data),
+
+  list: (data: ProxmoxCredentials) =>
+    api.post<{ vms: import('@/components/proxmox/types').ProxmoxVM[] }>('/proxmox/list', data),
+
+  import: (
+    data: ProxmoxCredentials & {
+      selected_vmids: number[]
+      integration_name: string
+      save_credentials: boolean
+      sync_interval_minutes: number
+    },
+  ) =>
+    api.post<{
+      host_node_id: string
+      created_node_ids: string[]
+      skipped_existing: number[]
+      integration_id: string | null
+    }>('/proxmox/import', data),
+
+  listIntegrations: () =>
+    api.get<import('@/components/proxmox/types').ProxmoxIntegration[]>('/proxmox/integrations'),
+
+  deleteIntegration: (id: string) => api.delete(`/proxmox/integrations/${id}`),
+
+  syncIntegration: (id: string) =>
+    api.post<import('@/components/proxmox/types').ProxmoxSyncResult>(
+      `/proxmox/integrations/${id}/sync`,
+      {},
+    ),
+}

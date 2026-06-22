@@ -22,6 +22,7 @@ import { EdgeModal } from '@/components/modals/EdgeModal'
 import { ScanConfigModal } from '@/components/modals/ScanConfigModal'
 import { SettingsModal } from '@/components/modals/SettingsModal'
 import { ZigbeeImportModal } from '@/components/zigbee/ZigbeeImportModal'
+import { ProxmoxImportModal } from '@/components/proxmox/ProxmoxImportModal'
 import { GroupRectModal, type GroupRectFormData } from '@/components/modals/GroupRectModal'
 import { TextModal, type TextFormData } from '@/components/modals/TextModal'
 import { ThemeModal } from '@/components/modals/ThemeModal'
@@ -77,6 +78,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [exportModalOpen, setExportModalOpen] = useState(false)
   const [zigbeeImportOpen, setZigbeeImportOpen] = useState(false)
+  const [proxmoxImportOpen, setProxmoxImportOpen] = useState(false)
 
   // Declare handleSave before the Ctrl+S effect so it is in scope.
   // Returns true on success, false on failure — the design-switch effect relies
@@ -615,6 +617,7 @@ export default function App() {
             onAddText={() => setAddTextOpen(true)}
             onScan={() => setScanConfigOpen(true)}
             onZigbeeImport={() => setZigbeeImportOpen(true)}
+            onProxmoxImport={() => setProxmoxImportOpen(true)}
             onSave={handleSave}
             onOpenSettings={() => setSettingsOpen(true)}
             onOpenHistory={() => setScanHistoryOpen(true)}
@@ -729,6 +732,16 @@ export default function App() {
             onAddToCanvas={handleZigbeeAddToCanvas}
             onPendingImported={() => {
               toast.success('Zigbee import started — check Scan History for results')
+            }}
+          />
+        )}
+
+        {!STANDALONE && (
+          <ProxmoxImportModal
+            open={proxmoxImportOpen}
+            onClose={() => setProxmoxImportOpen(false)}
+            onImported={() => {
+              if (activeDesignId) loadCanvasFromApi(activeDesignId)
             }}
           />
         )}

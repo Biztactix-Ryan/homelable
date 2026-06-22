@@ -117,6 +117,43 @@ def _add_service_check_job() -> None:
     )
 
 
+async def _run_proxmox_syncs() -> None:
+    """Sync every saved Proxmox integration whose interval has elapsed."""
+    from app.db.models import ProxmoxIntegration  # avoid circular import at module load
+    from app.services.proxmox_sync import sync_integration
+
+    now = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(ProxmoxIntegration))
+        integrations = list(result.scalars().all())
+
+    for integration in integrations:
+        interval = max(1, integration.sync_interval_minutes)
+        if integration.last_sync_at is not None:
+            elapsed_min = (now - integration.last_sync_at).total_seconds() / 60
+            if elapsed_min < interval:
+                continue
+        async with AsyncSessionLocal() as db:
+            row = await db.get(ProxmoxIntegration, integration.id)
+            if row is None:
+                continue
+            try:
+                await sync_integration(db, row)
+            except Exception as exc:
+                logger.error("Proxmox sync failed for %s: %s", integration.id, exc)
+
+
+def _add_proxmox_sync_job() -> None:
+    scheduler.add_job(
+        _run_proxmox_syncs,
+        "interval",
+        minutes=1,
+        id="proxmox_syncs",
+        max_instances=1,
+        coalesce=True,
+    )
+
+
 def start_scheduler() -> None:
     global scheduler
     if scheduler.running:
@@ -135,6 +172,7 @@ def start_scheduler() -> None:
     )
     if settings.service_check_enabled:
         _add_service_check_job()
+    _add_proxmox_sync_job()
     scheduler.start()
     logger.info("Scheduler started — status checks every %ds", settings.status_checker_interval)
 

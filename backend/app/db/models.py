@@ -60,6 +60,8 @@ class Node(Base):
     height: Mapped[float | None] = mapped_column(Float, nullable=True)
     bottom_handles: Mapped[int] = mapped_column(Integer, default=1)
     ieee_address: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    external_source: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    external_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
     last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     response_time_ms: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -115,6 +117,7 @@ class PendingDevice(Base):
     model: Mapped[str | None] = mapped_column(String, nullable=True)
     vendor: Mapped[str | None] = mapped_column(String, nullable=True)
     lqi: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    external_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
     discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -148,3 +151,38 @@ class ScanRun(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error: Mapped[str | None] = mapped_column(Text)
+
+
+class ProxmoxIntegration(Base):
+    """Stored credentials + sync config for a Proxmox VE host or cluster.
+
+    Created when the user ticks "save credentials" during import. Used by the
+    background sync job (discovers new VMs into pending_devices, refreshes
+    status on already-imported nodes) and by the per-node "proxmox" status
+    check method.
+
+    Secret values (token_secret, password) are Fernet-encrypted at rest; see
+    app.core.crypto.
+    """
+
+    __tablename__ = "proxmox_integrations"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    host: Mapped[str] = mapped_column(String, nullable=False)
+    port: Mapped[int] = mapped_column(Integer, default=8006)
+    verify_tls: Mapped[bool] = mapped_column(Boolean, default=False)
+    auth_type: Mapped[str] = mapped_column(String, nullable=False)  # "token" | "password"
+    # Token auth (auth_type == "token"): user@realm!tokenid + secret
+    token_user: Mapped[str | None] = mapped_column(String, nullable=True)
+    token_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    token_secret_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Password auth (auth_type == "password"): user@realm + password
+    username: Mapped[str | None] = mapped_column(String, nullable=True)
+    password_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sync_interval_minutes: Mapped[int] = mapped_column(Integer, default=15)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_sync_status: Mapped[str | None] = mapped_column(String, nullable=True)  # "ok" | "error"
+    last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
