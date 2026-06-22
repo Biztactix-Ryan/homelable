@@ -112,6 +112,10 @@ async def sync_integration(db: AsyncSession, integration: ProxmoxIntegration) ->
     integration.last_sync_status = "ok"
     integration.last_sync_error = None
     await db.commit()
+    # Drop any cached cluster snapshot — the next status check should see what
+    # we just fetched, not the previous tick's data.
+    from app.services.proxmox_status import invalidate_cache
+    invalidate_cache(integration_id)
     return ProxmoxSyncResponse(
         integration_id=integration_id,
         vms_seen=len(vms),

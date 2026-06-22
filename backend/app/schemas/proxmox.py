@@ -75,6 +75,14 @@ class ProxmoxImportRequest(ProxmoxCredentials):
 
     selected_vmids: list[int] = Field(..., description="vmid values of VMs to add to the canvas")
     integration_name: str = Field(..., description="Friendly name for this Proxmox host")
+    design_id: str | None = Field(
+        None,
+        description=(
+            "Design the imported nodes belong to. Required for the canvas to render them — "
+            "the canvas load endpoint filters by design_id, so a NULL value leaves the "
+            "nodes orphaned in the DB."
+        ),
+    )
     save_credentials: bool = False
     sync_interval_minutes: int = Field(15, ge=1, le=1440)
 

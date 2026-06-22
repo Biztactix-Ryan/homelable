@@ -180,6 +180,7 @@ export const proxmoxApi = {
     data: ProxmoxCredentials & {
       selected_vmids: number[]
       integration_name: string
+      design_id?: string | null
       save_credentials: boolean
       sync_interval_minutes: number
     },

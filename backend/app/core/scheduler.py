@@ -129,8 +129,15 @@ async def _run_proxmox_syncs() -> None:
 
     for integration in integrations:
         interval = max(1, integration.sync_interval_minutes)
-        if integration.last_sync_at is not None:
-            elapsed_min = (now - integration.last_sync_at).total_seconds() / 60
+        last_sync = integration.last_sync_at
+        if last_sync is not None:
+            # SQLite via SQLAlchemy returns DateTime(timezone=True) values as
+            # naive — treat them as UTC so the subtraction against the aware
+            # `now` succeeds (without this, every tick crashes once any
+            # integration has a recorded sync).
+            if last_sync.tzinfo is None:
+                last_sync = last_sync.replace(tzinfo=timezone.utc)
+            elapsed_min = (now - last_sync).total_seconds() / 60
             if elapsed_min < interval:
                 continue
         async with AsyncSessionLocal() as db:

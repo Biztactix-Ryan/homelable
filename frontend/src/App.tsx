@@ -740,6 +740,7 @@ export default function App() {
           <ProxmoxImportModal
             open={proxmoxImportOpen}
             onClose={() => setProxmoxImportOpen(false)}
+            designId={activeDesignId}
             onImported={() => {
               if (activeDesignId) loadCanvasFromApi(activeDesignId)
             }}

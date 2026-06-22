@@ -12,6 +12,8 @@ interface ProxmoxImportModalProps {
   open: boolean
   onClose: () => void
   onImported?: () => void
+  /** Design the imported nodes belong to — without it the canvas can't see them. */
+  designId?: string | null
 }
 
 interface ConnectionForm {
@@ -46,7 +48,7 @@ const DEFAULT_FORM: ConnectionForm = {
 
 const VM_TYPE_ICON = { vm: Server, lxc: Box } as const
 
-export function ProxmoxImportModal({ open, onClose, onImported }: ProxmoxImportModalProps) {
+export function ProxmoxImportModal({ open, onClose, onImported, designId }: ProxmoxImportModalProps) {
   const [form, setForm] = useState<ConnectionForm>(DEFAULT_FORM)
   const [connectionStatus, setConnectionStatus] = useState<'idle' | 'testing' | 'ok' | 'fail'>('idle')
   const [connectionMsg, setConnectionMsg] = useState('')
@@ -158,6 +160,7 @@ export function ProxmoxImportModal({ open, onClose, onImported }: ProxmoxImportM
         ...buildCredentials(),
         selected_vmids: Array.from(checked),
         integration_name: form.integration_name.trim(),
+        design_id: designId ?? null,
         save_credentials: form.save_credentials,
         sync_interval_minutes: Math.max(1, Number(form.sync_interval_minutes) || 15),
       })

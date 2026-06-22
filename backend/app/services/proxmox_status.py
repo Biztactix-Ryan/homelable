@@ -8,9 +8,14 @@ the status_checker dispatcher: {status, response_time_ms}.
 Ephemeral imports (integration_id starts with "ephemeral-") have no stored
 credentials, so this returns 'unknown' for them — the user has to re-import
 under a saved integration to get live status.
+
+list_vms() is cached per integration for a short TTL so that one tick of the
+status checker — which fans out across every node in the canvas — produces a
+single Proxmox cluster fetch per integration instead of one fetch per VM.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -19,13 +24,48 @@ from sqlalchemy import select
 
 from app.db.database import AsyncSessionLocal
 from app.db.models import Node, ProxmoxIntegration
-from app.services.proxmox_service import check_vm_status
+from app.services.proxmox_service import ProxmoxAuth, list_vms
 from app.services.proxmox_sync import integration_to_auth
 
 logger = logging.getLogger(__name__)
 
 
 _UNKNOWN: dict[str, Any] = {"status": "unknown", "response_time_ms": None}
+
+# Short-TTL cache so a status-check tick doesn't fan out into N cluster fetches.
+# 25s is < the default status_checker_interval (60s), so the first VM to be
+# checked in a tick triggers a fresh fetch and everyone else in that tick reads
+# the result. Module-level state because the cache is process-wide.
+_VMS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_VMS_LOCKS: dict[str, asyncio.Lock] = {}
+_VMS_CACHE_TTL = 25.0
+
+
+async def _cached_list_vms(integration: ProxmoxIntegration, auth: ProxmoxAuth) -> list[dict[str, Any]]:
+    """Return list_vms(integration) with per-integration TTL caching.
+
+    Cache miss path acquires a per-integration lock so concurrent status checks
+    don't issue duplicate requests; the second waiter sees the cached result
+    immediately on lock acquire.
+    """
+    now_t = time.monotonic()
+    cached = _VMS_CACHE.get(integration.id)
+    if cached and now_t - cached[0] < _VMS_CACHE_TTL:
+        return cached[1]
+    lock = _VMS_LOCKS.setdefault(integration.id, asyncio.Lock())
+    async with lock:
+        cached = _VMS_CACHE.get(integration.id)
+        if cached and time.monotonic() - cached[0] < _VMS_CACHE_TTL:
+            return cached[1]
+        vms = await list_vms(integration.host, integration.port, auth, integration.verify_tls)
+        _VMS_CACHE[integration.id] = (time.monotonic(), vms)
+        return vms
+
+
+def invalidate_cache(integration_id: str) -> None:
+    """Drop a cached VM list — call after a sync_integration run so subsequent
+    status checks see the freshest data."""
+    _VMS_CACHE.pop(integration_id, None)
 
 
 async def check_proxmox_node(check_target: str | None) -> dict[str, Any]:
@@ -43,31 +83,21 @@ async def check_proxmox_node(check_target: str | None) -> dict[str, Any]:
         integration = await db.get(ProxmoxIntegration, integration_id)
         if not integration:
             return _UNKNOWN
-
-        # The cluster-resources field is keyed by external_id, not vmid, so it tells
-        # us which Proxmox node (cluster member) owns this VM and whether it's qemu/lxc.
         node_row = await db.execute(
             select(Node).where(Node.external_id == check_target, Node.external_source == "proxmox")
         )
         node = node_row.scalar_one_or_none()
         if not node:
             return _UNKNOWN
-
         try:
             auth = integration_to_auth(integration)
         except Exception as exc:
             logger.warning("Proxmox creds for integration %s could not be decrypted: %s", integration_id, exc)
             return _UNKNOWN
 
-    # Resolve {proxmox_node, vm_type} from a cluster-resources fetch. Cheap call
-    # (cached server-side; one HTTP round-trip per node check). Could be optimized
-    # to a single per-tick fetch shared across all proxmox nodes, but the obvious
-    # implementation has cache-invalidation cost — keep it simple unless it bites.
-    from app.services.proxmox_service import list_vms
-
     start = time.monotonic()
     try:
-        vms = await list_vms(integration.host, integration.port, auth, integration.verify_tls)
+        vms = await _cached_list_vms(integration, auth)
     except Exception as exc:
         logger.debug("Proxmox list_vms failed during status check: %s", exc)
         return {"status": "offline", "response_time_ms": None}
@@ -76,17 +106,19 @@ async def check_proxmox_node(check_target: str | None) -> dict[str, Any]:
     if not match:
         return _UNKNOWN
 
-    status: dict[str, Any] = {
-        "status": "online" if match.get("status") == "running" else "offline",
+    # Cluster summary is authoritative — `paused` -> offline, anything else
+    # unknown -> unknown (don't fall through to per-VM endpoint, which proxies
+    # via the owning cluster node and returns 595 when that node is offline,
+    # producing log noise without adding any information cluster/resources
+    # doesn't already give us).
+    summary_status = match.get("status")
+    if summary_status == "running":
+        resolved = "online"
+    elif summary_status in ("stopped", "paused"):
+        resolved = "offline"
+    else:
+        resolved = "unknown"
+    return {
+        "status": resolved,
         "response_time_ms": int((time.monotonic() - start) * 1000),
     }
-    # Drill into the per-VM endpoint only if the cluster summary says paused —
-    # paused VMs report 'paused' (not running, not stopped) which we treat as offline
-    # but might be worth distinguishing later.
-    if match.get("status") not in ("running", "stopped", "paused"):
-        per_vm = await check_vm_status(
-            integration.host, integration.port, auth, integration.verify_tls,
-            match["node"], match["type"], vmid,
-        )
-        status["status"] = per_vm
-    return status

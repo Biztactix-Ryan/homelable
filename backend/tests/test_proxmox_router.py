@@ -123,6 +123,7 @@ async def test_import_creates_host_and_vm_nodes(
     client: AsyncClient, headers: dict, db_session: AsyncSession
 ):
     body = {**_TOKEN_BODY, "selected_vmids": [100, 200], "integration_name": "Home Cluster",
+            "design_id": "design-abc",
             "save_credentials": False, "sync_interval_minutes": 15}
     with patch("app.api.routes.proxmox.list_vms", new=AsyncMock(return_value=_SAMPLE_VMS)):
         res = await client.post("/api/v1/proxmox/import", json=body, headers=headers)
@@ -133,15 +134,18 @@ async def test_import_creates_host_and_vm_nodes(
     assert data["skipped_existing"] == []
     assert data["integration_id"] is None  # not saved
 
-    # Host node should be a container, VMs should be children
+    # Host node should be a container, VMs should be children, every imported
+    # row should be stamped with the design_id so the canvas can render them.
     nodes = (await db_session.execute(select(Node))).scalars().all()
     host = next(n for n in nodes if n.external_source == "proxmox-host")
     assert host.container_mode is True
     assert host.label == "Home Cluster"
+    assert host.design_id == "design-abc"
     vms = [n for n in nodes if n.external_source == "proxmox"]
     assert len(vms) == 2
     assert all(n.parent_id == host.id for n in vms)
     assert all(n.check_method == "proxmox" for n in vms)
+    assert all(n.design_id == "design-abc" for n in vms)
 
 
 @pytest.mark.asyncio

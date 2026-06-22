@@ -129,7 +129,7 @@ async def import_proxmox_vms(
         if vm["vmid"] in existing_by_external:
             skipped.append(vm["vmid"])
             continue
-        node = _vm_to_node(vm, host_node.id, integration_id)
+        node = _vm_to_node(vm, host_node.id, integration_id, payload.design_id)
         db.add(node)
         await db.flush()
         created_ids.append(node.id)
@@ -226,6 +226,7 @@ async def _get_or_create_host_node(
         hostname=payload.host,
         status="unknown",
         container_mode=True,
+        design_id=payload.design_id,
         external_source="proxmox-host",
         external_id=host_external_id,
     )
@@ -252,13 +253,16 @@ async def _existing_vm_node_map(db: AsyncSession, integration_id: str) -> dict[i
     return out
 
 
-def _vm_to_node(vm: dict[str, Any], host_id: str, integration_id: str) -> Node:
+def _vm_to_node(
+    vm: dict[str, Any], host_id: str, integration_id: str, design_id: str | None
+) -> Node:
     """Build a Node row from a normalized VM dict."""
     ext = f"{integration_id}:{vm['vmid']}"
     return Node(
         type="lxc" if vm["type"] == "lxc" else "vm",
         label=vm["name"],
         parent_id=host_id,
+        design_id=design_id,
         status=status_to_node_status(vm.get("status")),
         check_method="proxmox",
         # check_target stores the external_id so the status checker can find
