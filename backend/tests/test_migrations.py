@@ -105,6 +105,59 @@ async def test_legacy_canvas_migrates_into_default_design(legacy_engine):
         await engine.dispose()
 
 
+async def test_proxmox_columns_added_to_existing_schema(legacy_engine):
+    """A DB that predates the Proxmox integration must gain external_source /
+    external_id columns and indices on startup, with no data loss.
+    """
+    db_path, engine = legacy_engine
+    await _build_legacy_schema(engine)
+
+    await database.init_db()
+
+    check = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    try:
+        async with check.begin() as conn:
+            nodes_cols = {
+                row[1] for row in
+                (await conn.exec_driver_sql("PRAGMA table_info(nodes)")).fetchall()
+            }
+            assert "external_source" in nodes_cols
+            assert "external_id" in nodes_cols
+
+            pending_cols = {
+                row[1] for row in
+                (await conn.exec_driver_sql("PRAGMA table_info(pending_devices)")).fetchall()
+            }
+            assert "external_id" in pending_cols
+
+            indices = {
+                row[1] for row in
+                (await conn.exec_driver_sql("SELECT * FROM sqlite_master WHERE type='index'"))
+                .fetchall()
+            }
+            assert "ix_nodes_external_source" in indices
+            assert "ix_nodes_external_id" in indices
+            assert "ix_pending_devices_external_id" in indices
+
+            # proxmox_integrations table is brand new and should be auto-created.
+            tables = {
+                row[0] for row in
+                (await conn.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )).fetchall()
+            }
+            assert "proxmox_integrations" in tables
+
+            # Existing nodes still round-trip.
+            nodes = (await conn.exec_driver_sql(
+                "SELECT id, label FROM nodes ORDER BY id"
+            )).fetchall()
+            assert [(n[0], n[1]) for n in nodes] == [("n1", "Old Server"), ("n2", "Old Router")]
+    finally:
+        await check.dispose()
+        await engine.dispose()
+
+
 async def test_migration_is_idempotent(legacy_engine):
     """Running init_db twice must not duplicate the design or drop any data."""
     db_path, engine = legacy_engine

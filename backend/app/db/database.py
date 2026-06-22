@@ -124,6 +124,34 @@ async def init_db() -> None:
         ]
         for label, sql in zigbee_migrations:
             await _try_migrate(conn, sql, label=label)
+        # --- Proxmox integration schema migrations ----------------------------
+        # external_source/external_id let any external system (Proxmox today,
+        # likely others later) dedup re-imports and scheduled-discovery hits
+        # against existing canvas nodes and pending entries.
+        proxmox_migrations: list[tuple[str, str]] = [
+            ("nodes.external_source", "ALTER TABLE nodes ADD COLUMN external_source VARCHAR"),
+            ("nodes.external_id", "ALTER TABLE nodes ADD COLUMN external_id VARCHAR"),
+            (
+                "nodes.external_source.index",
+                "CREATE INDEX IF NOT EXISTS ix_nodes_external_source ON nodes(external_source)",
+            ),
+            (
+                "nodes.external_id.index",
+                "CREATE INDEX IF NOT EXISTS ix_nodes_external_id ON nodes(external_id)",
+            ),
+            (
+                "pending_devices.external_id",
+                "ALTER TABLE pending_devices ADD COLUMN external_id VARCHAR",
+            ),
+            (
+                "pending_devices.external_id.index",
+                "CREATE INDEX IF NOT EXISTS ix_pending_devices_external_id "
+                "ON pending_devices(external_id)",
+            ),
+        ]
+        for label, sql in proxmox_migrations:
+            await _try_migrate(conn, sql, label=label)
+        # --- end Proxmox integration schema migrations ------------------------
         # Drop NOT NULL on pending_devices.ip (Zigbee devices have no IP).
         # SQLite can't ALTER column nullability — rebuild the table if needed.
         try:
