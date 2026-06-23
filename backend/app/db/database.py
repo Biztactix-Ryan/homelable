@@ -31,6 +31,137 @@ async def _try_migrate(conn: AsyncConnection, sql: str, *, label: str) -> None:
         else:
             logger.warning("Migration %s failed: %s", label, exc)
 
+
+async def _backfill_devices(conn: AsyncConnection) -> None:
+    """Create a Device for every existing Node that has identity facts but no
+    device_id link yet. Idempotent — only touches rows where device_id IS NULL.
+
+    Multiple Nodes that share an identity (e.g. same MAC after legacy data
+    edits) get merged into a single Device by the match-first-then-create
+    order — first row creates the Device, later rows find it via lookup.
+    """
+    await _backfill_table_devices(
+        conn,
+        table="nodes",
+        type_column="type",
+        source_column="external_source",
+        log_label="Node",
+    )
+    await _backfill_table_devices(
+        conn,
+        table="pending_devices",
+        type_column="suggested_type",
+        source_column="discovery_source",
+        log_label="PendingDevice",
+    )
+
+
+async def _backfill_table_devices(
+    conn: AsyncConnection,
+    *,
+    table: str,
+    type_column: str,
+    source_column: str,
+    log_label: str,
+) -> None:
+    # PRAGMA the live schema — legacy installs (and minimal test fixtures)
+    # may lack some identity columns we'd otherwise SELECT. Skip the backfill
+    # when device_id isn't present yet (its own migration hasn't fired) or
+    # when none of the identity columns exist.
+    info = await conn.exec_driver_sql(f"PRAGMA table_info({table})")
+    cols = {row[1] for row in info.fetchall()}
+    if "device_id" not in cols:
+        return
+    identity_cols = [
+        c for c in ("ip", "mac", "hostname", "os", "ieee_address", source_column, "external_id")
+        if c in cols
+    ]
+    if not identity_cols:
+        return
+    if type_column not in cols:
+        type_column = "NULL"  # placeholder — backfilled rows just lack a kind
+    kind_alias = "__kind"
+    type_select = f"{type_column} AS {kind_alias}" if type_column != "NULL" else f"NULL AS {kind_alias}"
+    select_col_list = ["id", *identity_cols, type_select]
+    select_clause = ", ".join(select_col_list)
+    select_names = ["id", *identity_cols, kind_alias]
+    where_present = " OR ".join(
+        f"{c} IS NOT NULL"
+        for c in identity_cols
+        if c in {"ip", "mac", "hostname", "ieee_address", "external_id"}
+    )
+    if not where_present:
+        return
+    rows = (await conn.exec_driver_sql(
+        f"SELECT {select_clause} FROM {table} "
+        f"WHERE device_id IS NULL AND ({where_present})"
+    )).fetchall()
+    if not rows:
+        return
+    logger.info("Backfilling Device rows for %d legacy %s(s)", len(rows), log_label)
+    for row in rows:
+        rec = dict(zip(select_names, row, strict=False))
+        row_id = rec["id"]
+        ip = rec.get("ip")
+        mac = rec.get("mac")
+        hostname = rec.get("hostname")
+        ieee = rec.get("ieee_address")
+        ext_source = rec.get(source_column)
+        ext_id = rec.get("external_id")
+        kind = rec.get(kind_alias)
+        mac_lc = mac.lower() if mac else None
+        device_id: str | None = None
+
+        # Match precedence — most reliable first.
+        if ext_source and ext_id:
+            r = await conn.exec_driver_sql(
+                "SELECT id FROM devices WHERE external_source = ? AND external_id = ? LIMIT 1",
+                (ext_source, ext_id),
+            )
+            d = r.fetchone()
+            if d:
+                device_id = d[0]
+        if device_id is None and ieee:
+            r = await conn.exec_driver_sql(
+                "SELECT id FROM devices WHERE ieee_address = ? LIMIT 1", (ieee,),
+            )
+            d = r.fetchone()
+            if d:
+                device_id = d[0]
+        if device_id is None and mac_lc:
+            r = await conn.exec_driver_sql(
+                "SELECT id FROM devices WHERE primary_mac = ? LIMIT 1", (mac_lc,),
+            )
+            d = r.fetchone()
+            if d:
+                device_id = d[0]
+
+        if device_id is None:
+            device_id = str(_uuid_mod.uuid4())
+            await conn.exec_driver_sql(
+                "INSERT INTO devices "
+                "(id, primary_mac, macs, primary_hostname, hostnames, primary_ip, ips, "
+                " ieee_address, external_source, external_id, vendor, kind, first_seen, last_seen) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+                (
+                    device_id,
+                    mac_lc,
+                    _json.dumps([mac_lc] if mac_lc else []),
+                    hostname,
+                    _json.dumps([hostname] if hostname else []),
+                    ip,
+                    _json.dumps([ip] if ip else []),
+                    ieee,
+                    ext_source,
+                    ext_id,
+                    None,
+                    kind,
+                ),
+            )
+        await conn.exec_driver_sql(
+            f"UPDATE {table} SET device_id = ? WHERE id = ?", (device_id, row_id),
+        )
+
 # Ensure the data directory exists before SQLite tries to open the file
 Path(settings.sqlite_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -152,6 +283,34 @@ async def init_db() -> None:
         for label, sql in proxmox_migrations:
             await _try_migrate(conn, sql, label=label)
         # --- end Proxmox integration schema migrations ------------------------
+        # --- Device identity split schema migrations --------------------------
+        # Adds Node.device_id FK; the devices / discovery_facts tables themselves
+        # are created by create_all above (they're brand new, not modifications
+        # of an existing schema). Backfill is non-destructive and idempotent —
+        # see _backfill_devices below.
+        device_split_migrations: list[tuple[str, str]] = [
+            (
+                "nodes.device_id",
+                "ALTER TABLE nodes ADD COLUMN device_id VARCHAR REFERENCES devices(id)",
+            ),
+            (
+                "nodes.device_id.index",
+                "CREATE INDEX IF NOT EXISTS ix_nodes_device_id ON nodes(device_id)",
+            ),
+            (
+                "pending_devices.device_id",
+                "ALTER TABLE pending_devices ADD COLUMN device_id VARCHAR REFERENCES devices(id)",
+            ),
+            (
+                "pending_devices.device_id.index",
+                "CREATE INDEX IF NOT EXISTS ix_pending_devices_device_id "
+                "ON pending_devices(device_id)",
+            ),
+        ]
+        for label, sql in device_split_migrations:
+            await _try_migrate(conn, sql, label=label)
+        await _backfill_devices(conn)
+        # --- end Device identity split schema migrations ----------------------
         # Drop NOT NULL on pending_devices.ip (Zigbee devices have no IP).
         # SQLite can't ALTER column nullability — rebuild the table if needed.
         try:

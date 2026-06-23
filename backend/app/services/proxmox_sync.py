@@ -23,8 +23,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.crypto import decrypt
 from app.db.models import Node, PendingDevice, ProxmoxIntegration
 from app.schemas.proxmox import ProxmoxSyncResponse
+from app.services.device_service import record_fact, resolve_device
 from app.services.proxmox_service import (
     ProxmoxAuth,
+    get_vm_macs,
     list_vms,
     status_to_node_status,
 )
@@ -105,7 +107,42 @@ async def sync_integration(db: AsyncSession, integration: ProxmoxIntegration) ->
         elif ext in existing_pending:
             pending_skipped += 1
         else:
-            db.add(_vm_to_pending(vm, integration_id))
+            # New VM discovered since the last sync. Best-effort MAC enrichment
+            # so the cross-source dedup (vs nmap, LLDP, ...) can match. Cheap
+            # in practice — scheduled syncs only hit this path when something
+            # new appears (typically zero or one VM per tick).
+            macs = await get_vm_macs(
+                integration.host, integration.port, auth, integration.verify_tls,
+                vm["node"], vm["type"], vm["vmid"],
+            )
+            primary_mac = macs[0] if macs else None
+            device = await resolve_device(
+                db,
+                mac=primary_mac,
+                hostname=vm.get("name"),
+                external_source="proxmox",
+                external_id=ext,
+                kind="lxc" if vm["type"] == "lxc" else "vm",
+            )
+            for extra_mac in macs[1:]:
+                await resolve_device(
+                    db, mac=extra_mac, external_source="proxmox", external_id=ext,
+                )
+            await record_fact(
+                db,
+                device=device,
+                source="proxmox",
+                source_ref=ext,
+                facts={
+                    "vmid": vm["vmid"],
+                    "type": vm["type"],
+                    "node": vm.get("node"),
+                    "status": vm.get("status"),
+                    "macs": macs,
+                    "via": "scheduled-sync",
+                },
+            )
+            db.add(_vm_to_pending(vm, integration_id, device.id, primary_mac))
             pending_created += 1
 
     integration.last_sync_at = datetime.now(timezone.utc)
@@ -153,8 +190,12 @@ async def _existing_pending_map(db: AsyncSession, integration_id: str) -> dict[s
     return {p.external_id: p for p in result.scalars().all() if p.external_id}
 
 
-def _vm_to_pending(vm: dict[str, Any], integration_id: str) -> PendingDevice:
+def _vm_to_pending(
+    vm: dict[str, Any], integration_id: str, device_id: str, mac: str | None,
+) -> PendingDevice:
     return PendingDevice(
+        device_id=device_id,
+        mac=mac,
         hostname=vm.get("name"),
         suggested_type="lxc" if vm["type"] == "lxc" else "vm",
         status="pending",

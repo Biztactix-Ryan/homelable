@@ -95,6 +95,7 @@ async def _tombstone_external_descendants(db: AsyncSession, node: Node) -> None:
         # discovery_source="proxmox".
         source = n.external_source if n.external_source != "proxmox-host" else "proxmox"
         db.add(PendingDevice(
+            device_id=n.device_id,
             ip=n.ip,
             mac=n.mac,
             hostname=n.hostname,

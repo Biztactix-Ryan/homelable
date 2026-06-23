@@ -34,9 +34,11 @@ from app.schemas.proxmox import (
     ProxmoxVMOut,
 )
 from app.services import proxmox_sync
+from app.services.device_service import record_fact, resolve_device
 from app.services.proxmox_service import (
     ProxmoxAuth,
     check_connection,
+    get_vm_macs,
     list_vms,
     status_to_node_status,
 )
@@ -129,7 +131,43 @@ async def import_proxmox_vms(
         if vm["vmid"] in existing_by_external:
             skipped.append(vm["vmid"])
             continue
-        node = _vm_to_node(vm, host_node.id, integration_id, payload.design_id)
+        # Best-effort MAC enrichment so cross-source dedup (vs nmap, LLDP, ...)
+        # can match by L2 identity. Failure of the config endpoint must never
+        # block the import — get_vm_macs already swallows errors.
+        macs = await get_vm_macs(
+            payload.host, payload.port, auth, payload.verify_tls,
+            vm["node"], vm["type"], vm["vmid"],
+        )
+        primary_mac = macs[0] if macs else None
+        ext = f"{integration_id}:{vm['vmid']}"
+        device = await resolve_device(
+            db,
+            mac=primary_mac,
+            hostname=vm.get("name"),
+            external_source="proxmox",
+            external_id=ext,
+            kind="lxc" if vm["type"] == "lxc" else "vm",
+        )
+        # Surface every NIC on the Device (multi-homed VMs).
+        for extra_mac in macs[1:]:
+            await resolve_device(db, mac=extra_mac, external_source="proxmox", external_id=ext)
+        await record_fact(
+            db,
+            device=device,
+            source="proxmox",
+            source_ref=ext,
+            facts={
+                "vmid": vm["vmid"],
+                "type": vm["type"],
+                "node": vm.get("node"),
+                "status": vm.get("status"),
+                "cpu_count": vm.get("cpu_count"),
+                "ram_gb": vm.get("ram_gb"),
+                "disk_gb": vm.get("disk_gb"),
+                "macs": macs,
+            },
+        )
+        node = _vm_to_node(vm, host_node.id, integration_id, payload.design_id, device.id, primary_mac)
         db.add(node)
         await db.flush()
         created_ids.append(node.id)
@@ -209,7 +247,12 @@ def _build_integration_row(payload: ProxmoxImportRequest) -> ProxmoxIntegration:
 async def _get_or_create_host_node(
     db: AsyncSession, integration_id: str, payload: ProxmoxImportRequest
 ) -> Node:
-    """Find the Proxmox host node for this integration or create it."""
+    """Find the Proxmox host node for this integration or create it.
+
+    The host itself is a device (identity = hostname + external_id of the
+    integration), so it gets a Device row + DiscoveryFact too — that way a
+    later nmap discovery of the Proxmox host's IP can dedupe against it.
+    """
     host_external_id = f"{integration_id}:host"
     result = await db.execute(
         select(Node).where(
@@ -220,6 +263,20 @@ async def _get_or_create_host_node(
     node = result.scalar_one_or_none()
     if node:
         return node
+    device = await resolve_device(
+        db,
+        hostname=payload.host,
+        external_source="proxmox-host",
+        external_id=host_external_id,
+        kind="proxmox",
+    )
+    await record_fact(
+        db,
+        device=device,
+        source="proxmox-host",
+        source_ref=host_external_id,
+        facts={"host": payload.host, "port": payload.port},
+    )
     node = Node(
         type="proxmox",
         label=payload.integration_name,
@@ -227,6 +284,7 @@ async def _get_or_create_host_node(
         status="unknown",
         container_mode=True,
         design_id=payload.design_id,
+        device_id=device.id,
         external_source="proxmox-host",
         external_id=host_external_id,
     )
@@ -254,20 +312,33 @@ async def _existing_vm_node_map(db: AsyncSession, integration_id: str) -> dict[i
 
 
 def _vm_to_node(
-    vm: dict[str, Any], host_id: str, integration_id: str, design_id: str | None
+    vm: dict[str, Any],
+    host_id: str,
+    integration_id: str,
+    design_id: str | None,
+    device_id: str | None,
+    primary_mac: str | None,
 ) -> Node:
-    """Build a Node row from a normalized VM dict."""
+    """Build a Node row from a normalized VM dict.
+
+    `device_id` is the canonical identity row (see resolve_device). The Node's
+    legacy identity columns (mac, etc.) are denormalised cache mirroring the
+    Device — kept populated so the rest of the app (which still reads them)
+    keeps working until those code paths are migrated.
+    """
     ext = f"{integration_id}:{vm['vmid']}"
     return Node(
         type="lxc" if vm["type"] == "lxc" else "vm",
         label=vm["name"],
         parent_id=host_id,
         design_id=design_id,
+        device_id=device_id,
         status=status_to_node_status(vm.get("status")),
         check_method="proxmox",
         # check_target stores the external_id so the status checker can find
         # the integration + vmid without a separate column.
         check_target=ext,
+        mac=primary_mac,
         cpu_count=vm.get("cpu_count"),
         ram_gb=vm.get("ram_gb"),
         disk_gb=vm.get("disk_gb"),

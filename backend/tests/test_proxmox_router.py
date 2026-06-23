@@ -8,7 +8,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Node, ProxmoxIntegration
+from app.db.models import Device, DiscoveryFact, Node, ProxmoxIntegration
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 
@@ -125,7 +125,8 @@ async def test_import_creates_host_and_vm_nodes(
     body = {**_TOKEN_BODY, "selected_vmids": [100, 200], "integration_name": "Home Cluster",
             "design_id": "design-abc",
             "save_credentials": False, "sync_interval_minutes": 15}
-    with patch("app.api.routes.proxmox.list_vms", new=AsyncMock(return_value=_SAMPLE_VMS)):
+    with patch("app.api.routes.proxmox.list_vms", new=AsyncMock(return_value=_SAMPLE_VMS)), \
+         patch("app.api.routes.proxmox.get_vm_macs", new=AsyncMock(return_value=[])):
         res = await client.post("/api/v1/proxmox/import", json=body, headers=headers)
     assert res.status_code == 200
     data = res.json()
@@ -146,6 +147,53 @@ async def test_import_creates_host_and_vm_nodes(
     assert all(n.parent_id == host.id for n in vms)
     assert all(n.check_method == "proxmox" for n in vms)
     assert all(n.design_id == "design-abc" for n in vms)
+
+    # Every imported node now resolves to a Device (canonical identity).
+    assert host.device_id is not None
+    assert all(n.device_id is not None for n in vms)
+    devices = (await db_session.execute(select(Device))).scalars().all()
+    assert len(devices) == 3  # host + 2 VMs
+
+    # And each gets at least one DiscoveryFact recording where it came from.
+    facts = (await db_session.execute(select(DiscoveryFact))).scalars().all()
+    sources = {f.source for f in facts}
+    assert "proxmox" in sources
+    assert "proxmox-host" in sources
+
+
+@pytest.mark.asyncio
+async def test_import_with_mac_creates_device_matchable_by_mac(
+    client: AsyncClient, headers: dict, db_session: AsyncSession
+):
+    """End-to-end: a Proxmox VM imported with a MAC should produce a Device whose
+    primary_mac matches — so a later nmap (or anything else) discovery using
+    that MAC would resolve to the same Device, not create a duplicate."""
+    body = {**_TOKEN_BODY, "selected_vmids": [100], "integration_name": "Cluster",
+            "design_id": "d-1",
+            "save_credentials": False, "sync_interval_minutes": 15}
+    with patch("app.api.routes.proxmox.list_vms", new=AsyncMock(return_value=_SAMPLE_VMS)), \
+         patch(
+            "app.api.routes.proxmox.get_vm_macs",
+            new=AsyncMock(return_value=["bc:24:11:aa:bb:cc"]),
+         ):
+        res = await client.post("/api/v1/proxmox/import", json=body, headers=headers)
+    assert res.status_code == 200
+
+    # The VM's Device should have the MAC populated.
+    vm_node = (await db_session.execute(
+        select(Node).where(Node.external_id == "i1:100".replace("i1", "ephemeral-"))
+    )).scalar_one_or_none()
+    # The integration_id is ephemeral-prefixed for this test (no save). Pull by
+    # external_source instead — there's only one VM.
+    if vm_node is None:
+        vm_node = (await db_session.execute(
+            select(Node).where(Node.external_source == "proxmox")
+        )).scalar_one()
+    assert vm_node.device_id is not None
+    device = await db_session.get(Device, vm_node.device_id)
+    assert device is not None
+    assert device.primary_mac == "bc:24:11:aa:bb:cc"
+    assert vm_node.mac == "bc:24:11:aa:bb:cc"  # denormalised cache populated
 
 
 @pytest.mark.asyncio

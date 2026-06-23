@@ -13,6 +13,7 @@ background scheduler.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -193,3 +194,53 @@ def status_to_node_status(proxmox_status: str | None) -> str:
     if proxmox_status in ("stopped", "paused"):
         return "offline"
     return "unknown"
+
+
+_MAC_RE = re.compile(r"\b([0-9a-f]{2}(?::[0-9a-f]{2}){5})\b", re.IGNORECASE)
+
+
+def extract_macs_from_config(config: dict[str, Any]) -> list[str]:
+    """Pull every NIC MAC out of a Proxmox VM or LXC config response.
+
+    Both qemu and lxc store NICs in netN keys; the value is a comma-separated
+    KEY=VALUE string. For qemu the MAC is the driver value (e.g.
+    `virtio=BC:24:11:AA:BB:CC,...`); for lxc it's `hwaddr=...`. We just regex
+    for any colon-separated 6-byte hex string — covers both formats and stays
+    forward-compatible with config additions.
+    """
+    macs: list[str] = []
+    for key, value in (config or {}).items():
+        if not key.startswith("net") or not isinstance(value, str):
+            continue
+        match = _MAC_RE.search(value)
+        if match:
+            macs.append(match.group(1).lower())
+    return macs
+
+
+async def get_vm_macs(
+    host: str,
+    port: int,
+    auth: ProxmoxAuth,
+    verify_tls: bool,
+    node: str,
+    vm_type: str,
+    vmid: int,
+) -> list[str]:
+    """Fetch and parse the per-VM config endpoint, returning all MACs.
+
+    Returns an empty list on any failure — MAC enrichment is best-effort and
+    must never block an import. Logged at debug.
+    """
+    api_type = "qemu" if vm_type == "vm" else vm_type
+    try:
+        data = await _request(
+            "GET", host, port, f"/nodes/{node}/{api_type}/{vmid}/config", auth, verify_tls,
+        )
+    except Exception as exc:
+        logger.debug(
+            "Proxmox config fetch failed for %s/%s/%s: %s",
+            node, api_type, vmid, _sanitize_error(exc),
+        )
+        return []
+    return extract_macs_from_config(data or {})

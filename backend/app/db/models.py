@@ -27,6 +27,55 @@ class Design(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
+class Device(Base):
+    """Canonical identity for a physical or virtual entity discovered by any
+    source. Lives independently of any canvas — a Device exists once and any
+    number of Nodes can reference it (across multiple designs).
+
+    Identity facts (mac, hostname, ip) are tracked as both a `primary_*`
+    indexed column (the most recently observed value, used for lookups) and a
+    `*s` JSON list (the full set of values ever seen, used to match later
+    discoveries that surface an older value).
+    """
+
+    __tablename__ = "devices"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    primary_mac: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    macs: Mapped[list[str]] = mapped_column(JSON, default=list)
+    primary_hostname: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    hostnames: Mapped[list[str]] = mapped_column(JSON, default=list)
+    primary_ip: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    ips: Mapped[list[str]] = mapped_column(JSON, default=list)
+    ieee_address: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    external_source: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    external_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    vendor: Mapped[str | None] = mapped_column(String, nullable=True)
+    kind: Mapped[str | None] = mapped_column(String, nullable=True)
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class DiscoveryFact(Base):
+    """Append-only log of what each discovery source observed about a Device.
+
+    Lets you answer "where did I learn this device exists?", "when did Proxmox
+    last confirm this VM?", "did LLDP see this switch behind another switch?".
+    Source code never deletes these; they're a permanent audit trail.
+    """
+
+    __tablename__ = "discovery_facts"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    device_id: Mapped[str] = mapped_column(
+        String, ForeignKey("devices.id", ondelete="CASCADE"), index=True, nullable=False,
+    )
+    source: Mapped[str] = mapped_column(String, index=True, nullable=False)
+    source_ref: Mapped[str | None] = mapped_column(String, nullable=True)
+    facts: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class Node(Base):
     __tablename__ = "nodes"
 
@@ -34,6 +83,13 @@ class Node(Base):
     type: Mapped[str] = mapped_column(String, nullable=False)
     label: Mapped[str] = mapped_column(String, nullable=False)
     design_id: Mapped[str | None] = mapped_column(String, ForeignKey("designs.id", ondelete="SET NULL"), nullable=True)
+    # FK to the canonical Device. Nullable because decorative nodes (group
+    # rects, text labels) have no underlying device, and because legacy rows
+    # haven't been backfilled yet. ondelete=SET NULL preserves the canvas
+    # placement if a device gets purged.
+    device_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("devices.id", ondelete="SET NULL"), index=True, nullable=True,
+    )
     hostname: Mapped[str | None] = mapped_column(String)
     ip: Mapped[str | None] = mapped_column(String)
     mac: Mapped[str | None] = mapped_column(String)
@@ -103,6 +159,9 @@ class PendingDevice(Base):
     __tablename__ = "pending_devices"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    device_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("devices.id", ondelete="SET NULL"), index=True, nullable=True,
+    )
     ip: Mapped[str | None] = mapped_column(String, nullable=True)
     mac: Mapped[str | None] = mapped_column(String)
     hostname: Mapped[str | None] = mapped_column(String)
